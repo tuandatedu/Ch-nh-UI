@@ -12,11 +12,26 @@ from backend_client import (
     search_ranked, route_preview, origin_suggest_sync, 
     chatbot_ask, intake_origin, ip_location
 )
+from datetime import datetime, timezone
 import time  # <-- thêm để debounce
 import re
 from streamlit_js_eval import get_geolocation
 
+
 st.set_page_config(page_title="NestFeast", layout="wide")
+st.markdown("""
+<style>
+.leaflet-control-container .leaflet-control-attribution,
+.leaflet-control-attribution,
+.leaflet-bottom.leaflet-right,
+.leaflet-control-container .leaflet-control {
+    display: none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# -------------------------------------------------------
 
 # --- mapping lựa chọn UI → tags/mode ---
 TAG_MAP = {
@@ -292,12 +307,11 @@ def _nf_reset_chat_ctx():
 FIREBASE_API_KEY = st.secrets["firebase_login"]["apiKey"]
 
 # Temporarily comment out Firebase to test Streamlit
-# if not firebase_admin._apps:
-#     cred = credentials.Certificate(dict(st.secrets["firebase_admin"]))
-#     firebase_admin.initialize_app(cred)
-# db = firestore.client()
+if not firebase_admin._apps:
+    cred = credentials.Certificate(dict(st.secrets["firebase_admin"]))
+    firebase_admin.initialize_app(cred)
+db = firestore.client()
 
-db = None  # placeholder
 
 def firebase_sign_in(email, password):
     url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={FIREBASE_API_KEY}"
@@ -305,18 +319,74 @@ def firebase_sign_in(email, password):
     return requests.post(url, json=payload).json()
 
 
-def load_history(user_email):
-    # Temporarily disabled
-    return []
-    # history_ref = db.collection("users").document(user_email).collection("history").order_by("timestamp")
-    # history_docs = history_ref.stream()
-    # history_list = []
-    # for doc in history_docs:
-    #     data = doc.to_dict()
-    #     data["timestamp"] = data["timestamp"].strftime("%d-%m-%Y %H:%M:%S")
-    #     history_list.append(data)
-    # return history_list
+from datetime import datetime
 
+def load_history(user_email):
+    history_ref = (
+        db.collection("users")
+          .document(user_email)
+          .collection("history")
+          .order_by("timestamp")
+          .limit(200)
+    )
+    docs = list(history_ref.stream())
+    if not docs:
+        return []
+
+    msgs_raw = []
+    for doc in docs:
+        data = doc.to_dict()
+        ts_raw = data.get("timestamp")
+
+        dt = None
+        if ts_raw is not None:
+            try:
+                if hasattr(ts_raw, "to_datetime"):
+                    dt = ts_raw.to_datetime().astimezone()
+                elif isinstance(ts_raw, datetime):
+                    dt = ts_raw.astimezone()
+            except Exception:
+                dt = None
+
+        msgs_raw.append({
+            "role": data.get("role", "assistant"),
+            "content": data.get("content", ""),
+            "dt": dt,
+        })
+
+    dates = [
+        m["dt"].date()
+        for m in msgs_raw
+        if isinstance(m.get("dt"), datetime)
+    ]
+    if not dates:
+        return [{"role": m["role"], "content": m["content"], "date": ""} for m in msgs_raw]
+
+    unique_dates = sorted(set(dates))
+    selected_dates = set(unique_dates[-2:])   # 🔥 2 ngày gần nhất
+
+    msgs = []
+    for m in msgs_raw:
+        dt = m.get("dt")
+        if isinstance(dt, datetime) and dt.date() in selected_dates:
+            msgs.append({
+                "role": m["role"],
+                "content": m["content"],
+                "date": dt.strftime("%d-%m-%Y"),   # hoặc "%d-%m-%Y" nếu thích
+            })
+
+    return msgs
+
+
+def save_chat_message(user_email: str, role: str, content: str):
+    if not user_email:
+        return  # không lưu khi chưa login
+
+    db.collection("users").document(user_email).collection("history").add({
+        "role": role,
+        "content": content,
+        "timestamp": firestore.SERVER_TIMESTAMP
+    })
 
 # ======= Session state =======
 if "user" not in st.session_state:
@@ -368,11 +438,27 @@ if "ctx_confirmed" not in st.session_state:
     
 # ======= Chatbot session state =======
 if "chat_open" not in st.session_state:
-    st.session_state.chat_open = True  # mở sẵn khung chat
+    st.session_state.chat_open = False  # mở sẵn khung chat
 if "chat_msgs" not in st.session_state:
-    st.session_state.chat_msgs = [
-        {"role": "assistant", "content": "Hi! I can suggest nearby places or show **details #n** of a place."}
-    ]
+    if st.session_state.get("user"):
+        try:
+            msgs = load_history(st.session_state.user)
+        except Exception:
+            msgs = []
+
+        if msgs:
+            st.session_state.chat_msgs = msgs
+        else:
+            st.session_state.chat_msgs = [
+                {"role": "assistant",
+                 "content": "Hi! I can suggest nearby places or show **details #n** of a place."}
+            ]
+    else:
+        st.session_state.chat_msgs = [
+            {"role": "assistant",
+             "content": "Hi! I can suggest nearby places or show **details #n** of a place."}
+        ]
+
 if "chat_last_chips" not in st.session_state:
     st.session_state.chat_last_chips = []  # nhớ chips để render lại nút bấm
     
@@ -418,13 +504,21 @@ def get_base64_image(path: str | Path) -> str:
 
 ASSETS_DIR = Path(__file__).resolve().parent / ".image"
 IMG_PATH = ASSETS_DIR / "logo.jpg"
+BG_PATH = ASSETS_DIR / "background.jpg"
 
 img_base64 = ""
+bg_base64 = ""
 if IMG_PATH.exists():
     img_base64 = get_base64_image(IMG_PATH)
 
+if BG_PATH.exists():
+    bg_base64 = get_base64_image(BG_PATH)
+
+
 logo_tag = f'<img src="data:image/jpeg;base64,{img_base64}" width="100">' if img_base64 else ""
-img_html = f'<img src="data:image/jpeg;base64,{img_base64}" width="56" style="border-radius:8px;">' if img_base64 else ""
+img_html = f'<img src="data:image/jpeg;base64,{img_base64}" width="80" style="border-radius:8px;">' if img_base64 else ""
+
+
 
 st.markdown(f"""
 <div class="nf-nav">
@@ -464,8 +558,32 @@ st.markdown(f"""
   background: rgba(255, 255, 255, 0.15);
   transform: translateY(-2px);
 }}
+
+.stApp {{
+    background-image: url("data:image/jpeg;base64,{bg_base64}");
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+}}
+
+.stApp > div:first-child {{
+    background-color: rgba(255, 255, 255, 0.25);
+    backdrop-filter: blur(2px);
+}}
+
+iframe {{
+    display: block;
+}}
+.leaflet-bottom.leaflet-right {{
+    display: none !important;
+}}
+.leaflet-control-container .leaflet-control-attribution {{
+    display: none !important;
+}}
 </style>
 """, unsafe_allow_html=True)
+
+
 
 # --- LOGIN FORM ---
 if st.session_state.show_login:
@@ -476,11 +594,11 @@ if st.session_state.show_login:
         header {visibility: hidden;}
         .login-container {
             max-width: 450px;
-            margin: 40px auto;
-            padding: 40px;
-            background: white;
+            margin: 5px auto;        
+            padding: 15px;             
+            background: transparent;
             border-radius: 16px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+            box-shadow: none;
         }
         </style>
         """, unsafe_allow_html=True)
@@ -520,11 +638,11 @@ if st.session_state.show_register:
         header {visibility: hidden;}
         .register-container {
             max-width: 450px;
-            margin: 40px auto;
-            padding: 40px;
-            background: white;
+            margin: 5px auto;          
+            padding: 20px;       
+            background: transparent;
             border-radius: 16px;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+            box-shadow: none;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -972,6 +1090,8 @@ with col1:
                 st.toast("Using current location", icon="✅")
             except Exception:
                 pass
+
+            _log_ctx_snapshot("Origin set to current location")
             st.rerun()
 
 
@@ -1078,8 +1198,148 @@ res = st.session_state.res
 c_map, c_list = st.columns([1.2, 1])
 status = st.empty()
 
-# === ALWAYS-ON MAP (luôn hiện map, cho phép chọn origin bằng click) ===
+# # === ALWAYS-ON MAP (luôn hiện map, cho phép chọn origin bằng click) ===
+# with c_map:
+#     # Toggle cho phép pick trên map
+#     prev_pick = st.session_state.get("nf_pick_on_map", False)
+#     pick_flag = st.toggle(
+#         "🗺️ Pick origin on map",
+#         value=prev_pick,
+#         help="Click on the map to set the origin.",
+#     )
+#     st.session_state.nf_pick_on_map = pick_flag
+
+#     # Nếu tắt toggle → reset click cũ để lần sau bật lại có thể chọn cùng vị trí
+#     if not pick_flag:
+#         st.session_state.nf_last_map_click = None
+
+#     # Lấy dữ liệu cho map: items (nếu đã có kết quả) + origin hiện có
+#     items_for_map = (res or {}).get("items") or []
+
+#     # ⚠️ ƯU TIÊN origin_selected (từ map / suggest / My location)
+#     # rồi mới tới origin trong kết quả search cũ
+#     origin_for_map = (
+#         st.session_state.get("origin_selected")
+#         or (res or {}).get("origin")
+#         or {}
+#     )
+
+#     # Toạ độ trung tâm: ưu tiên origin, fallback sang item đầu tiên (nếu có)
+#     center_lat = center_lng = None
+#     if isinstance(origin_for_map, dict):
+#         center_lat = origin_for_map.get("lat")
+#         center_lng = origin_for_map.get("lng")
+#     if not (_is_num(center_lat) and _is_num(center_lng)):
+#         if items_for_map:
+#             center_lat = items_for_map[0].get("lat")
+#             center_lng = items_for_map[0].get("lng")
+
+#     # Nếu đang ở chế độ xem route_preview và có đủ dữ liệu → vẽ route,
+#     # ngược lại luôn vẽ map điểm (origin + items)
+#     rp_state = st.session_state.get("route_preview")
+#     if rp_state and res and not st.session_state.pending_cands:
+#         # origin lấy từ kết quả gần nhất (ưu tiên), fallback origin_for_map
+#         o_lat, o_lng = pick_lat_lng((res or {}).get("origin") or origin_for_map or {})
+#         d_lat, d_lng = pick_lat_lng((rp_state or {}).get("dest") or {})
+#         rp = (rp_state or {}).get("rp") or {}
+#         if _is_num(o_lat) and _is_num(o_lng) and _is_num(d_lat) and _is_num(d_lng):
+#             render_route_map(
+#                 origin={"lat": float(o_lat), "lng": float(o_lng)},
+#                 dest={"lat": float(d_lat), "lng": float(d_lng)},
+#                 rp=rp,
+#                 height_px=420,
+#             )
+#         else:
+#             # Thiếu dữ liệu route → quay lại map điểm
+#             render_osm_map(
+#                 center_lat, center_lng, items_for_map,
+#                 height_px=420, zoom_start=14, pickable=pick_flag
+#             )
+#     else:
+#         # Map điểm bình thường (kể cả lúc chưa có kết quả nào)
+#         render_osm_map(
+#             center_lat, center_lng, items_for_map,
+#             height_px=420, zoom_start=14, pickable=pick_flag
+#         )
+
+
+# clicked = st.button("RECOMMENDER", type="primary")
+# if clicked:
+#     st.session_state.route_preview = None
+#     status.markdown("🟢 **RUNNING...**")
+
+#     # Lưu query chung
+#     st.session_state.last_query = dict(
+#         tags=TAG_MAP[st.session_state.opt_label],
+#         radius_m=int(st.session_state.radius_km * 1000),
+#         mode=MODE_MAP[st.session_state.mode_label],
+#         seed_cap=30, limit=20, lang="en", country="vn",
+#     )
+
+#     try:
+#         with st.spinner("Finding the best places..."):
+#             origin_payload = st.session_state.get("origin_selected")
+            
+#             # FINAL ATTEMPT: nếu đã có origin_selected nhưng thiếu lat/lng → thử chuẩn hoá từ text
+#             if origin_payload and not (_is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))):
+#                 try:
+#                     norm = intake_origin(origin_text=st.session_state.get("origin_text",""))
+#                     ori  = (norm or {}).get("origin") or {}
+#                     lat  = _to_float(ori.get("lat")); lng = _to_float(ori.get("lng"))
+#                     if _is_num(lat) and _is_num(lng):
+#                         st.session_state.origin_selected.update({
+#                             "lat": float(lat), "lng": float(lng),
+#                             "display_address": ori.get("display_address") or st.session_state.get("origin_text",""),
+#                             "place_id": ori.get("place_id") or st.session_state.origin_selected.get("place_id"),
+#                         })
+#                         origin_payload = st.session_state.origin_selected
+#                 except Exception:
+#                     pass
+
+#             # ✅ Ưu tiên lat/lng nếu đã lock hoặc text khớp (đỡ bị confirm lại)
+#             use_point = bool(
+#                 origin_payload
+#                 and _is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))
+#                 and (
+#                     st.session_state.get("origin_locked", False) or
+#                     (str(origin_payload.get("display_address", "")).strip()
+#                     == (st.session_state.get("origin_text", "") or "").strip())
+#                 )
+#             )
+
+#             if use_point:
+#                 res = search_ranked(
+#                     origin={
+#                         "lat": float(origin_payload["lat"]),
+#                         "lng": float(origin_payload["lng"]),
+#                         "kind": origin_payload.get("kind", "point"),
+#                         "display_address": origin_payload.get("display_address"),
+#                         "place_id": origin_payload.get("place_id"),
+#                     },
+#                     **st.session_state.last_query,
+#                 )
+#             else:
+#                 # Fallback an toàn: dùng origin_text hiện tại
+#                 res = search_ranked(
+#                     origin_text=st.session_state.get("origin_text", ""),
+#                     **st.session_state.last_query
+#                 )
+#     except Exception as e:
+#         status.error("❌ FAILED")
+#         st.exception(e)
+#         st.stop()
+#     else:
+#         status.success("✅ DONE")
+#         st.session_state.res = res
+#         st.session_state.pending_cands = res.get("candidates") if res.get("need_confirm") else None
+#         st.rerun()
+
+# c_map, c_list = st.columns([1.2, 1])
+
 with c_map:
+    # Hộp hiện trạng thái chạy
+    status = st.empty()
+
     # Toggle cho phép pick trên map
     prev_pick = st.session_state.get("nf_pick_on_map", False)
     pick_flag = st.toggle(
@@ -1093,18 +1353,83 @@ with c_map:
     if not pick_flag:
         st.session_state.nf_last_map_click = None
 
-    # Lấy dữ liệu cho map: items (nếu đã có kết quả) + origin hiện có
-    items_for_map = (res or {}).get("items") or []
+    # ⬇️ NÚT RECOMMENDER NGAY DƯỚI TOGGLE
+    clicked = st.button("RECOMMENDER", type="primary", use_container_width=True)
+    if clicked:
+        st.session_state.route_preview = None
+        status.markdown("🟢 **RUNNING...**")
 
-    # ⚠️ ƯU TIÊN origin_selected (từ map / suggest / My location)
-    # rồi mới tới origin trong kết quả search cũ
+        # Lưu query chung
+        st.session_state.last_query = dict(
+            tags=TAG_MAP[st.session_state.opt_label],
+            radius_m=int(st.session_state.radius_km * 1000),
+            mode=MODE_MAP[st.session_state.mode_label],
+            seed_cap=30, limit=20, lang="en", country="vn",
+        )
+
+        try:
+            with st.spinner("Finding the best places..."):
+                origin_payload = st.session_state.get("origin_selected")
+
+                if origin_payload and not (_is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))):
+                    try:
+                        norm = intake_origin(origin_text=st.session_state.get("origin_text",""))
+                        ori  = (norm or {}).get("origin") or {}
+                        lat  = _to_float(ori.get("lat")); lng = _to_float(ori.get("lng"))
+                        if _is_num(lat) and _is_num(lng):
+                            st.session_state.origin_selected.update({
+                                "lat": float(lat), "lng": float(lng),
+                                "display_address": ori.get("display_address") or st.session_state.get("origin_text",""),
+                                "place_id": ori.get("place_id") or st.session_state.origin_selected.get("place_id"),
+                            })
+                            origin_payload = st.session_state.origin_selected
+                    except Exception:
+                        pass
+
+                use_point = bool(
+                    origin_payload
+                    and _is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))
+                    and (
+                        st.session_state.get("origin_locked", False) or
+                        (str(origin_payload.get("display_address", "")).strip()
+                         == (st.session_state.get("origin_text", "") or "").strip())
+                    )
+                )
+
+                if use_point:
+                    res = search_ranked(
+                        origin={
+                            "lat": float(origin_payload["lat"]),
+                            "lng": float(origin_payload["lng"]),
+                            "kind": origin_payload.get("kind", "point"),
+                            "display_address": origin_payload.get("display_address"),
+                            "place_id": origin_payload.get("place_id"),
+                        },
+                        **st.session_state.last_query,
+                    )
+                else:
+                    res = search_ranked(
+                        origin_text=st.session_state.get("origin_text", ""),
+                        **st.session_state.last_query
+                    )
+        except Exception as e:
+            status.error("❌ FAILED")
+            st.exception(e)
+            st.stop()
+        else:
+            status.success("✅ DONE")
+            st.session_state.res = res
+            st.session_state.pending_cands = res.get("candidates") if res.get("need_confirm") else None
+            st.rerun()
+
+    # ===== MAP BÊN DƯỚI NÚT =====
+    items_for_map = (st.session_state.res or {}).get("items") or []
     origin_for_map = (
         st.session_state.get("origin_selected")
-        or (res or {}).get("origin")
+        or (st.session_state.res or {}).get("origin")
         or {}
     )
 
-    # Toạ độ trung tâm: ưu tiên origin, fallback sang item đầu tiên (nếu có)
     center_lat = center_lng = None
     if isinstance(origin_for_map, dict):
         center_lat = origin_for_map.get("lat")
@@ -1114,12 +1439,9 @@ with c_map:
             center_lat = items_for_map[0].get("lat")
             center_lng = items_for_map[0].get("lng")
 
-    # Nếu đang ở chế độ xem route_preview và có đủ dữ liệu → vẽ route,
-    # ngược lại luôn vẽ map điểm (origin + items)
     rp_state = st.session_state.get("route_preview")
-    if rp_state and res and not st.session_state.pending_cands:
-        # origin lấy từ kết quả gần nhất (ưu tiên), fallback origin_for_map
-        o_lat, o_lng = pick_lat_lng((res or {}).get("origin") or origin_for_map or {})
+    if rp_state and st.session_state.res and not st.session_state.pending_cands:
+        o_lat, o_lng = pick_lat_lng((st.session_state.res or {}).get("origin") or origin_for_map or {})
         d_lat, d_lng = pick_lat_lng((rp_state or {}).get("dest") or {})
         rp = (rp_state or {}).get("rp") or {}
         if _is_num(o_lat) and _is_num(o_lng) and _is_num(d_lat) and _is_num(d_lng):
@@ -1130,89 +1452,11 @@ with c_map:
                 height_px=420,
             )
         else:
-            # Thiếu dữ liệu route → quay lại map điểm
-            render_osm_map(
-                center_lat, center_lng, items_for_map,
-                height_px=420, zoom_start=14, pickable=pick_flag
-            )
+            render_osm_map(center_lat, center_lng, items_for_map,
+                           height_px=420, zoom_start=14, pickable=pick_flag)
     else:
-        # Map điểm bình thường (kể cả lúc chưa có kết quả nào)
-        render_osm_map(
-            center_lat, center_lng, items_for_map,
-            height_px=420, zoom_start=14, pickable=pick_flag
-        )
-
-
-clicked = st.button("RECOMMENDER", type="primary")
-if clicked:
-    st.session_state.route_preview = None
-    status.markdown("🟢 **RUNNING...**")
-
-    # Lưu query chung
-    st.session_state.last_query = dict(
-        tags=TAG_MAP[st.session_state.opt_label],
-        radius_m=int(st.session_state.radius_km * 1000),
-        mode=MODE_MAP[st.session_state.mode_label],
-        seed_cap=30, limit=20, lang="en", country="vn",
-    )
-
-    try:
-        with st.spinner("Finding the best places..."):
-            origin_payload = st.session_state.get("origin_selected")
-            
-            # FINAL ATTEMPT: nếu đã có origin_selected nhưng thiếu lat/lng → thử chuẩn hoá từ text
-            if origin_payload and not (_is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))):
-                try:
-                    norm = intake_origin(origin_text=st.session_state.get("origin_text",""))
-                    ori  = (norm or {}).get("origin") or {}
-                    lat  = _to_float(ori.get("lat")); lng = _to_float(ori.get("lng"))
-                    if _is_num(lat) and _is_num(lng):
-                        st.session_state.origin_selected.update({
-                            "lat": float(lat), "lng": float(lng),
-                            "display_address": ori.get("display_address") or st.session_state.get("origin_text",""),
-                            "place_id": ori.get("place_id") or st.session_state.origin_selected.get("place_id"),
-                        })
-                        origin_payload = st.session_state.origin_selected
-                except Exception:
-                    pass
-
-            # ✅ Ưu tiên lat/lng nếu đã lock hoặc text khớp (đỡ bị confirm lại)
-            use_point = bool(
-                origin_payload
-                and _is_num(origin_payload.get("lat")) and _is_num(origin_payload.get("lng"))
-                and (
-                    st.session_state.get("origin_locked", False) or
-                    (str(origin_payload.get("display_address", "")).strip()
-                    == (st.session_state.get("origin_text", "") or "").strip())
-                )
-            )
-
-            if use_point:
-                res = search_ranked(
-                    origin={
-                        "lat": float(origin_payload["lat"]),
-                        "lng": float(origin_payload["lng"]),
-                        "kind": origin_payload.get("kind", "point"),
-                        "display_address": origin_payload.get("display_address"),
-                        "place_id": origin_payload.get("place_id"),
-                    },
-                    **st.session_state.last_query,
-                )
-            else:
-                # Fallback an toàn: dùng origin_text hiện tại
-                res = search_ranked(
-                    origin_text=st.session_state.get("origin_text", ""),
-                    **st.session_state.last_query
-                )
-    except Exception as e:
-        status.error("❌ FAILED")
-        st.exception(e)
-        st.stop()
-    else:
-        status.success("✅ DONE")
-        st.session_state.res = res
-        st.session_state.pending_cands = res.get("candidates") if res.get("need_confirm") else None
-        st.rerun()
+        render_osm_map(center_lat, center_lng, items_for_map,
+                       height_px=420, zoom_start=14, pickable=pick_flag)
 
 # Nếu BE yêu cầu xác nhận origin → show radio + nút Confirm
 if st.session_state.pending_cands:
@@ -1533,6 +1777,35 @@ def _onboarding_message() -> str:
         "Click **Save & start** to begin."
     )
 
+def _log_ctx_snapshot(reason: str = "Context updated"):
+    """
+    Ghi một dòng lịch sử vào chat (và Firebase) mô tả
+    origin / radius / transport / place type hiện tại.
+    """
+    ori  = st.session_state.get("origin_text") or st.session_state.get("chat_origin_text") or "N/A"
+    r    = int(st.session_state.get("radius_km", 3) or 3)
+    mode = st.session_state.get("mode_label", "motorcycling")
+    opt  = st.session_state.get("opt_label", "Cafe")
+
+    msg = (
+        f"**· NestFeast:** {reason}\n"
+        f"- Origin: `{ori}`\n"
+        f"- Radius: **{r} km**\n"
+        f"- Transport: `{mode}`\n"
+        f"- Place type: `{opt}`"
+    )
+
+    # assistant message trên UI
+    st.session_state.chat_msgs.append({"role": "assistant", "content": msg})
+
+    # nếu có user đăng nhập thì lưu luôn vào Firebase
+    try:
+        if st.session_state.get("user"):
+            save_chat_message(st.session_state.user, "assistant", msg)
+    except Exception:
+        pass
+
+
 
 # ==== Render kết quả + Map/Route ====
 if res and not st.session_state.pending_cands:
@@ -1581,6 +1854,8 @@ if res and not st.session_state.pending_cands:
                         st.error("Failed to fetch route from backend.")
                         st.exception(e)
 
+
+            
             # # Container scrollable cho danh sách
             # st.markdown("""
             # <div class="results-scroll-container">
@@ -1653,6 +1928,8 @@ with fab_box:
     if st.button("💬", key="nf_fab_btn", help="NestFeast Chat"):
         st.session_state.chat_open = not st.session_state.chat_open
 
+
+
 # 3) Drawer nổi (panel chat)
 if st.session_state.chat_open:
     with drawer_box:
@@ -1661,7 +1938,13 @@ if st.session_state.chat_open:
         c1, c2, c3 = st.columns([5, 1, 1])
         with c1:
             st.subheader("NestFeast Chat")
-            
+             # NEW: load chat history từ Firebase (nếu đã login)
+            if st.session_state.user:
+                try:
+                    st.session_state.history = load_history(st.session_state.user)
+                except Exception:
+                    # tránh crash nếu Firestore lỗi
+                    st.session_state.history = st.session_state.get("history", [])
         with c2:
             if st.button("✕", key="nf_close_btn"):
                 st.session_state.chat_open = False
@@ -1696,7 +1979,29 @@ if st.session_state.chat_open:
         #            "tags":             ctx.get("tags"),
         #            "__last_ctx_debug": st.session_state.get("__last_ctx_debug"),
         #        })
-              
+         # Hiển thị lịch sử gần nhất (tối đa 10 message) nếu có
+        if st.session_state.user and st.session_state.history:
+            with st.expander("🕒 Recent chat history", expanded=False):
+                last_date = None
+
+                for msg in st.session_state.history:
+                    date_str = msg.get("date", "")
+                    role = msg.get("role", "assistant")
+                    content = msg.get("content", "")
+
+                    # Khi đổi ngày → in header ngày + 1 đường kẻ
+                    if date_str != last_date:
+                        if last_date is not None:
+                            st.markdown("<hr style='opacity:0.3;'>", unsafe_allow_html=True)
+                        st.markdown(f"### {date_str}")   # 👈 ngày-tháng-năm
+                        last_date = date_str
+
+                    # Dùng chat_message => icon đỏ/vàng giống UI chính
+                    with st.chat_message(role):
+                        st.markdown(content)
+
+
+                    
         # 3a) Onboarding khi thiếu context tối thiểu
         if not _context_ready():
             with st.chat_message("assistant"):
@@ -1907,6 +2212,7 @@ if st.session_state.chat_open:
 
                     st.session_state.ctx_confirmed = True
                     st.session_state.chat_last_chips = []  # reset để hiện Quick actions
+                    _log_ctx_snapshot("Saved starting context")
                     st.rerun()
             with colB:
                 st.caption("Or pick the origin above and come back here.")
@@ -1933,12 +2239,22 @@ if st.session_state.chat_open:
                             st.rerun()
                         else:
                             text = chip["payload"]["text"]
+                            # user message
                             st.session_state.chat_msgs.append({"role": "user", "content": text})
+                            if st.session_state.user:
+                                save_chat_message(st.session_state.user, "user", text)
+
+                            # bot reply
                             resp = _send_or_prime(text)
                             _apply_ctx(resp)
-                            st.session_state.chat_msgs.append({"role": "assistant", "content": resp.get("reply","")})
+                            reply_text = resp.get("reply", "")
+                            st.session_state.chat_msgs.append({"role": "assistant", "content": reply_text})
+                            if st.session_state.user:
+                                save_chat_message(st.session_state.user, "assistant", reply_text)
+
                             st.session_state.chat_last_chips = resp.get("chips") or []
                             st.rerun()
+
                 st.markdown('</div>', unsafe_allow_html=True)
 
             # ----- Menu con: BÁN KÍNH -----
@@ -1953,10 +2269,20 @@ if st.session_state.chat_open:
                     if st.button("Apply", key="nf_apply_radius"):
                         st.session_state.radius_km = r
                         text = f"radius {int(r)} km"
+
+                        # user message
                         st.session_state.chat_msgs.append({"role": "user", "content": text})
+                        if st.session_state.user:
+                            save_chat_message(st.session_state.user, "user", text)
+
+                        # bot reply
                         resp = _send_or_prime(text)
                         _apply_ctx(resp)
-                        st.session_state.chat_msgs.append({"role": "assistant", "content": resp.get("reply","")})
+                        reply_text = resp.get("reply", "")
+                        st.session_state.chat_msgs.append({"role": "assistant", "content": reply_text})
+                        if st.session_state.user:
+                            save_chat_message(st.session_state.user, "assistant", reply_text)
+
                         st.session_state.chat_last_chips = resp.get("chips") or []
                         st.session_state.nf_show_radius_menu = False
                         st.rerun()
@@ -1975,17 +2301,26 @@ if st.session_state.chat_open:
                 )
                 c1, c2 = st.columns(2)
                 with c1:
-                    if st.button("Apply", key="nf_apply_mode"):
-                        st.session_state.mode_label = m
-                        en = {"walking": "walk", "motorcycling": "motorcycle", "driving": "drive", "truck": "truck"}
-                        text = f"I {en.get(m,m)}"
-                        st.session_state.chat_msgs.append({"role": "user", "content": text})
-                        resp = _send_or_prime(text)
-                        _apply_ctx(resp)
-                        st.session_state.chat_msgs.append({"role": "assistant", "content": resp.get("reply","")})
-                        st.session_state.chat_last_chips = resp.get("chips") or []
-                        st.session_state.nf_show_mode_menu = False
-                        st.rerun()
+                    st.session_state.mode_label = m
+                    en = {"walking": "walk", "motorcycling": "motorcycle", "driving": "drive", "truck": "truck"}
+                    text = f"I {en.get(m,m)}"
+
+                    # user message
+                    st.session_state.chat_msgs.append({"role": "user", "content": text})
+                    if st.session_state.user:
+                        save_chat_message(st.session_state.user, "user", text)
+
+                    # bot reply
+                    resp = _send_or_prime(text)
+                    _apply_ctx(resp)
+                    reply_text = resp.get("reply", "")
+                    st.session_state.chat_msgs.append({"role": "assistant", "content": reply_text})
+                    if st.session_state.user:
+                        save_chat_message(st.session_state.user, "assistant", reply_text)
+
+                    st.session_state.chat_last_chips = resp.get("chips") or []
+                    st.session_state.nf_show_mode_menu = False
+                    st.rerun()
                 with c2:
                     if st.button("Close", key="nf_close_mode"):
                         st.session_state.nf_show_mode_menu = False
@@ -2070,6 +2405,7 @@ if st.session_state.chat_open:
                         st.session_state.res = None
                         st.session_state.pending_cands = None
                         st.session_state.route_preview = None
+                        _log_ctx_snapshot("Origin set to current location")
                         st.rerun()
 
                 # ✅ Xác nhận 1 địa chỉ từ autocomplete
@@ -2119,6 +2455,7 @@ if st.session_state.chat_open:
                     st.session_state.res = None
                     st.session_state.pending_cands = None
                     st.session_state.route_preview = None
+                    _log_ctx_snapshot("Origin changed")
                     st.rerun()
 
                 if save_only:
@@ -2178,9 +2515,17 @@ if st.session_state.chat_open:
                         send_text = pl.get("text") or _chip_to_prompt(chip, "en") or chip.get("text") or (chip.get("label") or "")
                         show_text = chip.get("label") or "·"
                         st.session_state.chat_msgs.append({"role": "user", "content": show_text})
+                        if st.session_state.user:
+                            save_chat_message(st.session_state.user, "user", show_text)
+
+                        # bot reply (dùng send_text để BE hiểu đúng intent)
                         resp = _send_or_prime(send_text)
                         _apply_ctx(resp)
-                        st.session_state.chat_msgs.append({"role": "assistant", "content": resp.get("reply","")})
+                        reply_text = resp.get("reply","")
+                        st.session_state.chat_msgs.append({"role": "assistant", "content": reply_text})
+                        if st.session_state.user:
+                            save_chat_message(st.session_state.user, "assistant", reply_text)
+
                         st.session_state.chat_last_chips = resp.get("chips") or []
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -2213,10 +2558,20 @@ if st.session_state.chat_open:
             if nf_send and nf_text.strip() and st.session_state.nf_send_guard == 0:
                 st.session_state.nf_send_guard = 1
                 msg = nf_text.strip()
+
+                # user message
                 st.session_state.chat_msgs.append({"role": "user", "content": msg})
+                if st.session_state.user:
+                    save_chat_message(st.session_state.user, "user", msg)
+
+                # bot reply
                 resp = _send_or_prime(msg)
                 _apply_ctx(resp)
-                st.session_state.chat_msgs.append({"role": "assistant", "content": resp.get("reply", "")})
+                reply_text = resp.get("reply", "")
+                st.session_state.chat_msgs.append({"role": "assistant", "content": reply_text})
+                if st.session_state.user:
+                    save_chat_message(st.session_state.user, "assistant", reply_text)
+
                 st.session_state.chat_last_chips = resp.get("chips") or []
                 st.session_state.nf_send_guard = 0
                 st.rerun()
@@ -2355,3 +2710,25 @@ section.main .block-container div:has(> .element-container .nf-drawer-hook) [dat
 }
 </style>
 """, unsafe_allow_html=True)
+
+
+if bg_base64:
+    st.markdown(f"""
+    <style>
+    .stApp {{
+        background-image: url("data:image/jpeg;base64,{bg_base64}");
+        background-size: cover;
+        background-position: center;
+        background-attachment: fixed;
+    }}
+
+    /* Overlay nhẹ (rõ background hơn) */
+    .stApp > div:first-child {{
+        background-color: rgba(255, 255, 255, 0.75);
+        backdrop-filter: blur(1px);
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+
